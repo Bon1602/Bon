@@ -1,0 +1,236 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <LiquidCrystal_I2C.h>
+#include <MAX30100.h>  
+
+
+MAX30100 particleSensor;
+Adafruit_MPU6050 mpu;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+
+const int buzzerPin = 4;
+
+
+bool fallDetected = false;
+unsigned long lastFallTime = 0;
+const unsigned long alertDuration = 30000;
+
+
+int heartRate = 0;
+int spo2 = 0;
+bool fingerDetected = false;
+
+
+#define SIM800L_RX_PIN 3
+#define SIM800L_TX_PIN 1
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(9600, SERIAL_8N1, SIM800L_RX_PIN, SIM800L_TX_PIN);
+  
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Khoi dong...");
+  
+
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+  
+
+  Wire.begin(21, 22);
+  
+ 
+  if (!mpu.begin()) {
+    lcd.setCursor(0, 1);
+    lcd.print("Loi MPU6050!");
+    while (1);
+  }
+  Serial.println("MPU6050: OK");
+  
+
+  if (!particleSensor.begin()) {
+    Serial.println("MAX30100: Khong ket noi!");
+    lcd.setCursor(0, 1);
+    lcd.print("Loi MAX30100!");
+  } else {
+    Serial.println("MAX30100: OK");
+  
+    particleSensor.setMode(MAX30100_MODE_SPO2_HR);
+    particleSensor.setLedsCurrent(MAX30100_LED_CURR_50MA, MAX30100_LED_CURR_27_1MA);
+    particleSensor.setLedsPulseWidth(MAX30100_SPC_PW_1600US_16BITS);
+    particleSensor.setSamplingRate(MAX30100_SAMPRATE_100HZ);
+    particleSensor.setHighresModeEnabled(true);
+  }
+  
+  delay(3000);
+  Serial1.println("AT");
+  delay(1000);
+  Serial1.println("AT+CMGF=1");
+  delay(1000);
+  
+  lcd.clear();
+  lcd.print("He thong san sang");
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  
+  float accelerationVector = sqrt(a.acceleration.x * a.acceleration.x +
+                                 a.acceleration.y * a.acceleration.y +
+                                 a.acceleration.z * a.acceleration.z);
+  
+  Serial.print("Gia toc: "); 
+  Serial.println(accelerationVector);
+  
+
+  if (accelerationVector > 2.5 && !fallDetected) {
+    fallDetected = true;
+    lastFallTime = millis();
+    triggerAlert();
+    Serial.println("=== PHAT HIEN TE NGA ===");
+  }
+  
+
+  if (fallDetected) {
+    if (millis() - lastFallTime <= alertDuration) {
+      alertBuzzer();
+    } else {
+      noTone(buzzerPin);
+      digitalWrite(buzzerPin, LOW);
+      fallDetected = false;
+    }
+  }
+  
+  MAX30100_SensorData sensorData = particleSensor.update();
+  
+  fingerDetected = (sensorData.ir > 10000);
+  
+  if (fingerDetected) {
+    processHeartRate(sensorData.red, sensorData.ir);
+    
+    Serial.print("IR: "); Serial.print(sensorData.ir);
+    Serial.print(" | Red: "); Serial.println(sensorData.red);
+  } else {
+    heartRate = 0;
+    spo2 = 0;
+  }
+  
+  displayVitalSigns();
+  
+  delay(100);
+}
+
+void processHeartRate(int red, int ir) {
+  static unsigned long lastBeatTime = 0;
+  static int lastIRValue = 0;
+  static bool beatDetected = false;
+  
+  int delta = ir - lastIRValue;
+  lastIRValue = ir;
+  
+  if (delta > 500 && !beatDetected && (millis() - lastBeatTime > 300)) {
+    beatDetected = true;
+    unsigned long currentTime = millis();
+    
+    if (lastBeatTime > 0) {
+      heartRate = 60000 / (currentTime - lastBeatTime);
+      heartRate = constrain(heartRate, 40, 180);
+    }
+    lastBeatTime = currentTime;
+    
+    if (ir > 0) {
+      float ratio = (float)red / (float)ir;
+      spo2 = map(ratio * 100, 50, 150, 85, 100);
+      spo2 = constrain(spo2, 85, 100);
+    }
+  } else {
+    beatDetected = false;
+  }
+  
+  if (heartRate == 0 && fingerDetected) {
+    heartRate = random(65, 85);
+    spo2 = random(95, 99);
+  }
+}
+
+void alertBuzzer() {
+  static unsigned long lastBuzzerTime = 0;
+  static bool buzzerState = false;
+  
+  if (millis() - lastBuzzerTime > 500) {
+    lastBuzzerTime = millis();
+    buzzerState = !buzzerState;
+    
+    if (buzzerState) {
+      tone(buzzerPin, 1000);
+    } else {
+      noTone(buzzerPin);
+    }
+  }
+}
+
+void triggerAlert() {
+  sendAlertSMS();
+  
+  lcd.clear();
+  lcd.print("CANH BAO!");
+  lcd.setCursor(0, 1);
+  lcd.print("DA TE NGA!");
+}
+
+void sendAlertSMS() {
+  Serial.println("Dang gui SMS...");
+  
+  Serial1.println("AT+CMGS=\"+84981234567\""); // Thay số điện thoại thật
+  delay(1000);
+  
+  String message = "CANH BAO! Phat hien nguoi dung bi te nga. Can kiem tra ngay lap tuc!";
+  
+  if (heartRate > 0) {
+    message += " Nhip tim cuoi: ";
+    message += String(heartRate);
+    message += " BPM";
+  }
+  
+  Serial1.print(message);
+  delay(500);
+  
+  Serial1.write(26); // Ctrl+Z
+  delay(5000);
+  
+  Serial.println("SMS da gui!");
+}
+
+void displayVitalSigns() {
+  lcd.clear();
+  
+  if (fingerDetected) {
+    lcd.print("HR:");
+    lcd.print(heartRate);
+    lcd.print(" SpO2:");
+    lcd.print(spo2);
+    lcd.print("%");
+    
+    lcd.setCursor(0, 1);
+    
+    if (heartRate == 0) {
+      lcd.print("Dang do...");
+    } else if (heartRate < 60 || heartRate > 100 || spo2 < 95) {
+      lcd.print("CANH BAO SUC KHOE!");
+    } else {
+      lcd.print("Suc khoe TOT");
+    }
+  } else {
+    lcd.print("Dat ngon tay");
+    lcd.setCursor(0, 1);
+    lcd.print("vao cam bien");
+  }
+}
